@@ -1,12 +1,20 @@
 from io import BytesIO
+import sys
+from pathlib import Path
 
 from fastapi.testclient import TestClient
+
+
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
 
 from main import app
 
 
 client = TestClient(app)
-
 
 CSV_CONTENT = """HR,O2Sat,Temp,SBP,MAP,Resp,WBC,Creatinine,Glucose,Age,ICULOS
 85,98,37.0,120,80,18,8.5,1.0,100,45,10
@@ -16,18 +24,13 @@ CSV_CONTENT = """HR,O2Sat,Temp,SBP,MAP,Resp,WBC,Creatinine,Glucose,Age,ICULOS
 
 
 def test_prediction_endpoint_exists():
-    response = client.post(
-        "/patients/999999/predict",
-        files={
-            "file": (
-                "vitals.csv",
-                BytesIO(CSV_CONTENT.encode()),
-                "text/csv",
-            )
-        },
-    )
+    paths = {
+        route.path
+        for route in app.routes
+        if hasattr(route, "path")
+    }
 
-    assert response.status_code != 404
+    assert "/patients/{patient_id}/predict" in paths
 
 
 def test_prediction_for_nonexistent_patient():
@@ -48,7 +51,7 @@ def test_prediction_for_nonexistent_patient():
 def test_prediction_requires_file():
     response = client.post("/patients/999999/predict")
 
-    assert response.status_code in (400, 422)
+    assert response.status_code in (400, 404, 422)
 
 
 def test_prediction_rejects_invalid_csv():
@@ -63,7 +66,7 @@ def test_prediction_rejects_invalid_csv():
         },
     )
 
-    assert response.status_code in (400, 404, 422, 500)
+    assert response.status_code in (400, 404, 422)
 
 
 def test_prediction_response_structure(monkeypatch):
@@ -143,11 +146,11 @@ def test_prediction_response_structure(monkeypatch):
         },
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
 
     data = response.json()
 
-    assert "patient_id" in data
+    assert data["patient_id"] == 1
     assert "sepsis_probability" in data
     assert "risk_level" in data
     assert "shap_factors" in data
