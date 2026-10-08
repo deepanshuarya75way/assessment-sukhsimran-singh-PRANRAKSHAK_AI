@@ -1,35 +1,45 @@
 """
 Database layer for PranRakshak AI.
 
-This module contains:
+Provides:
 - SQLAlchemy engine/session configuration
-- Patient and prediction models
+- Patient persistence
+- Patient vitals persistence
 - Prediction persistence/retrieval
 - Prediction feedback persistence
 - Feedback validation state management
 - Training-dataset preparation helpers
+
+The ORM uses SQLAlchemy 2.x typed declarative mappings so Pylance can
+understand mapped attributes correctly.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
-from datetime import datetime
-from typing import Any, Optional
+from datetime import datetime, timezone
+from typing import Any, Generator, Optional
+from uuid import uuid4
 
 from sqlalchemy import (
-    Column,
+    Float,
     ForeignKey,
     Integer,
     String,
-    Float,
     UniqueConstraint,
     create_engine,
     text,
 )
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    Session,
+    mapped_column,
+    sessionmaker,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -43,11 +53,9 @@ DATABASE_URL = os.getenv(
     "sqlite:///./pranrakshak.db",
 )
 
-# SQLite needs this option when using multiple threads,
-# which is common with FastAPI/Uvicorn.
-connect_args: dict[str, Any] = {}
-
 is_sqlite = DATABASE_URL.startswith("sqlite")
+
+connect_args: dict[str, Any] = {}
 
 if is_sqlite:
     connect_args["check_same_thread"] = False
@@ -56,15 +64,18 @@ if is_sqlite:
 engine = create_engine(
     DATABASE_URL,
     connect_args=connect_args,
+    pool_pre_ping=True,
 )
 
 SessionLocal = sessionmaker(
-    autocommit=False,
-    autoflush=False,
     bind=engine,
+    autoflush=False,
+    autocommit=False,
 )
 
-Base = declarative_base()
+
+class Base(DeclarativeBase):
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +84,7 @@ Base = declarative_base()
 
 def utc_now_iso() -> str:
     """Return the current UTC time as an ISO-8601 string."""
-    return datetime.utcnow().isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def safe_json_loads(
@@ -91,6 +102,97 @@ def safe_json_loads(
         return default
 
 
+def _json_dumps(
+    value: Any,
+    default: Any,
+) -> str:
+    """Serialize JSON safely, falling back to a default value."""
+
+    try:
+        return json.dumps(
+            value if value is not None else default,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        return json.dumps(
+            default,
+            allow_nan=False,
+        )
+
+
+def _finite_float(
+    value: Any,
+) -> Optional[float]:
+    """Convert a value to a finite float, otherwise return None."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    return number if math.isfinite(number) else None
+
+
+def _safe_int(
+    value: Any,
+) -> Optional[int]:
+    """Convert a value to int, otherwise return None."""
+
+    try:
+        if value is None or value == "":
+            return None
+
+        return int(float(value))
+
+    except (TypeError, ValueError):
+        return None
+
+
+def _patient_to_dict(
+    patient: "Patient",
+) -> dict[str, Any]:
+    """Convert a Patient ORM object to the shape expected by API routes."""
+
+    return {
+        "id": patient.id,
+        "patient_id": patient.patient_id,
+        "name": patient.name,
+        "bed_number": patient.bed_number,
+        "age": patient.age,
+        "gender": patient.gender,
+        "created_at": patient.created_at,
+
+        # Legacy compatibility.
+        "admission_time": patient.admission_time,
+    }
+
+
+def _prediction_to_dict(
+    prediction: "Prediction",
+) -> dict[str, Any]:
+    """Convert a Prediction ORM object to a JSON-safe dictionary."""
+
+    return {
+        "id": prediction.id,
+        "patient_id": prediction.patient_id,
+        "sepsis_probability": prediction.sepsis_probability,
+        "risk_level": prediction.risk_level,
+        "shap_factors": safe_json_loads(
+            prediction.shap_json,
+            [],
+        ),
+        "predicted_at": prediction.predicted_at,
+        "model_version": prediction.model_version,
+        "input_features": safe_json_loads(
+            prediction.input_features_json,
+            {},
+        ),
+        "clinical_recommendation": (
+            prediction.clinical_recommendation
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Database Models
 # ---------------------------------------------------------------------------
@@ -98,35 +200,132 @@ def safe_json_loads(
 class Patient(Base):
     __tablename__ = "patients"
 
-    id = Column(
+    id: Mapped[int] = mapped_column(
         Integer,
         primary_key=True,
         autoincrement=True,
     )
 
-    patient_id = Column(
-        String,
+    # External identifier retained for compatibility.
+    patient_id: Mapped[str] = mapped_column(
+        String(100),
         unique=True,
         nullable=False,
     )
 
-    name = Column(
-        String,
+    name: Mapped[str] = mapped_column(
+        String(255),
         nullable=False,
     )
 
-    age = Column(
+    bed_number: Mapped[Optional[str]] = mapped_column(
+        String(100),
+        nullable=True,
+    )
+
+    age: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
     )
 
-    gender = Column(
-        String,
+    gender: Mapped[Optional[str]] = mapped_column(
+        String(50),
         nullable=True,
     )
 
-    admission_time = Column(
-        String,
+    created_at: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+
+    # Legacy field retained for existing databases.
+    admission_time: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+
+
+class PatientVital(Base):
+    __tablename__ = "patient_vitals"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        autoincrement=True,
+    )
+
+    patient_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey(
+            "patients.id",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+        index=True,
+    )
+
+    hour: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+    )
+
+    hr: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+    )
+
+    o2sat: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+    )
+
+    temp: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+    )
+
+    sbp: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+    )
+
+    map_val: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+    )
+
+    resp: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+    )
+
+    wbc: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+    )
+
+    creatinine: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+    )
+
+    glucose: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+    )
+
+    age: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    iculos: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    row_index: Mapped[Optional[int]] = mapped_column(
+        Integer,
         nullable=True,
     )
 
@@ -134,58 +333,55 @@ class Patient(Base):
 class Prediction(Base):
     __tablename__ = "predictions"
 
-    id = Column(
+    id: Mapped[int] = mapped_column(
         Integer,
         primary_key=True,
         autoincrement=True,
     )
 
-    patient_id = Column(
+    patient_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey(
             "patients.id",
             ondelete="CASCADE",
         ),
         nullable=False,
+        index=True,
     )
 
-    sepsis_probability = Column(
+    sepsis_probability: Mapped[float] = mapped_column(
         Float,
         nullable=False,
     )
 
-    risk_level = Column(
+    risk_level: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+    )
+
+    shap_json: Mapped[str] = mapped_column(
         String,
         nullable=False,
     )
 
-    shap_json = Column(
-        String,
+    predicted_at: Mapped[str] = mapped_column(
+        String(64),
         nullable=False,
     )
 
-    predicted_at = Column(
-        String,
-        nullable=False,
-    )
-
-    # ------------------------------------------------------------------
-    # NEW: Feedback / training dataset fields
-    # ------------------------------------------------------------------
-
-    model_version = Column(
-        String,
+    model_version: Mapped[str] = mapped_column(
+        String(100),
         nullable=False,
         default="1.0.0",
     )
 
-    input_features_json = Column(
+    input_features_json: Mapped[str] = mapped_column(
         String,
         nullable=False,
         default="{}",
     )
 
-    clinical_recommendation = Column(
+    clinical_recommendation: Mapped[str] = mapped_column(
         String,
         nullable=False,
         default="",
@@ -209,94 +405,79 @@ class PredictionFeedback(Base):
         ),
     )
 
-    id = Column(
+    id: Mapped[int] = mapped_column(
         Integer,
         primary_key=True,
         autoincrement=True,
     )
 
-    prediction_id = Column(
+    prediction_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey(
             "predictions.id",
             ondelete="CASCADE",
         ),
         nullable=False,
+        index=True,
     )
 
-    patient_id = Column(
+    patient_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey(
             "patients.id",
             ondelete="CASCADE",
         ),
         nullable=False,
+        index=True,
     )
 
-    # Authorized clinician/user identifier
-    submitted_by = Column(
-        String,
+    submitted_by: Mapped[str] = mapped_column(
+        String(255),
         nullable=False,
     )
 
-    # Whether the original prediction was correct
-    prediction_assessment = Column(
-        String,
+    prediction_assessment: Mapped[str] = mapped_column(
+        String(50),
         nullable=False,
     )
 
-    # Whether the clinical escalation recommendation was appropriate
-    recommendation_assessment = Column(
-        String,
+    recommendation_assessment: Mapped[str] = mapped_column(
+        String(50),
         nullable=False,
     )
 
-    # Actual clinical outcome
-    #
-    # Supported values:
-    #   SEPSIS
-    #   NO_SEPSIS
-    #   UNKNOWN
-    actual_outcome = Column(
-        String,
+    actual_outcome: Mapped[str] = mapped_column(
+        String(50),
         nullable=False,
     )
 
-    # When the actual outcome became known
-    outcome_at = Column(
+    outcome_at: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+
+    outcome_notes: Mapped[Optional[str]] = mapped_column(
         String,
         nullable=True,
     )
 
-    # Optional clinician notes
-    outcome_notes = Column(
-        String,
-        nullable=True,
+    validation_status: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
     )
 
-    # Dataset preparation state
-    #
-    # PENDING
-    # ELIGIBLE
-    # REJECTED
-    validation_status = Column(
+    validation_reason: Mapped[str] = mapped_column(
         String,
         nullable=False,
     )
 
-    validation_reason = Column(
-        String,
-        nullable=False,
-    )
-
-    # Prevent the same record from being exported repeatedly
-    dataset_exported_at = Column(
-        String,
+    dataset_exported_at: Mapped[Optional[str]] = mapped_column(
+        String(64),
         nullable=True,
     )
 
-    created_at = Column(
-        String,
+    created_at: Mapped[str] = mapped_column(
+        String(64),
         nullable=False,
     )
 
@@ -305,65 +486,206 @@ class PredictionFeedback(Base):
 # Database Initialization / Migration
 # ---------------------------------------------------------------------------
 
+def _sqlite_add_column_if_missing(
+    conn: Any,
+    table_name: str,
+    column_name: str,
+    ddl: str,
+) -> None:
+    """Add a SQLite column only when it is not already present."""
+
+    columns = {
+        row[1]
+        for row in conn.execute(
+            text(
+                f"PRAGMA table_info({table_name})"
+            )
+        )
+    }
+
+    if column_name not in columns:
+        logger.info(
+            "Adding database column: %s.%s",
+            table_name,
+            column_name,
+        )
+
+        conn.execute(
+            text(ddl)
+        )
+
+
+def _postgres_add_column_if_missing(
+    conn: Any,
+    table_name: str,
+    column_name: str,
+    ddl: str,
+) -> None:
+    """Add a PostgreSQL column only when it is not already present."""
+
+    conn.execute(
+        text(
+            f"ALTER TABLE {table_name} "
+            f"ADD COLUMN IF NOT EXISTS "
+            f"{column_name} {ddl}"
+        )
+    )
+
+
 def init_db() -> None:
-    """
-    Create missing tables and apply the small SQLite migration required
-    for the feedback feature.
+    """Create tables and migrate columns required by the current API."""
 
-    SQLAlchemy's create_all() creates missing tables but does not modify
-    existing tables by adding new columns. Therefore the three new
-    Prediction columns are added explicitly for an existing SQLite DB.
-    """
+    Base.metadata.create_all(
+        bind=engine
+    )
 
-    Base.metadata.create_all(bind=engine)
+    dialect = engine.dialect.name
 
-    if is_sqlite:
-        with engine.begin() as conn:
+    with engine.begin() as conn:
 
-            # Find existing Prediction columns.
-            result = conn.execute(
-                text(
-                    "PRAGMA table_info(predictions)"
-                )
+        if dialect == "sqlite":
+
+            # -----------------------------------------------------------
+            # Existing patients table migration
+            # -----------------------------------------------------------
+
+            _sqlite_add_column_if_missing(
+                conn,
+                "patients",
+                "bed_number",
+                (
+                    "ALTER TABLE patients "
+                    "ADD COLUMN bed_number TEXT"
+                ),
             )
 
-            existing_columns = {
-                row[1]
-                for row in result
-            }
+            _sqlite_add_column_if_missing(
+                conn,
+                "patients",
+                "created_at",
+                (
+                    "ALTER TABLE patients "
+                    "ADD COLUMN created_at TEXT"
+                ),
+            )
 
-            migrations = {
-                "model_version": (
+            # -----------------------------------------------------------
+            # Existing predictions table migration
+            # -----------------------------------------------------------
+
+            _sqlite_add_column_if_missing(
+                conn,
+                "predictions",
+                "model_version",
+                (
                     "ALTER TABLE predictions "
                     "ADD COLUMN model_version "
                     "TEXT NOT NULL DEFAULT '1.0.0'"
                 ),
+            )
 
-                "input_features_json": (
+            _sqlite_add_column_if_missing(
+                conn,
+                "predictions",
+                "input_features_json",
+                (
                     "ALTER TABLE predictions "
                     "ADD COLUMN input_features_json "
                     "TEXT NOT NULL DEFAULT '{}'"
                 ),
+            )
 
-                "clinical_recommendation": (
+            _sqlite_add_column_if_missing(
+                conn,
+                "predictions",
+                "clinical_recommendation",
+                (
                     "ALTER TABLE predictions "
                     "ADD COLUMN clinical_recommendation "
                     "TEXT NOT NULL DEFAULT ''"
                 ),
-            }
+            )
 
-            for column_name, statement in migrations.items():
+            # Backfill existing patient timestamps.
+            conn.execute(
+                text(
+                    "UPDATE patients "
+                    "SET created_at = "
+                    "COALESCE(created_at, admission_time, :now) "
+                    "WHERE created_at IS NULL "
+                    "OR created_at = ''"
+                ),
+                {
+                    "now": utc_now_iso()
+                },
+            )
 
-                if column_name not in existing_columns:
+        elif dialect == "postgresql":
 
-                    logger.info(
-                        "Adding database column: predictions.%s",
-                        column_name,
-                    )
+            # -----------------------------------------------------------
+            # Existing patients table migration
+            # -----------------------------------------------------------
 
-                    conn.execute(
-                        text(statement)
-                    )
+            _postgres_add_column_if_missing(
+                conn,
+                "patients",
+                "bed_number",
+                "TEXT",
+            )
+
+            _postgres_add_column_if_missing(
+                conn,
+                "patients",
+                "created_at",
+                "TEXT",
+            )
+
+            # -----------------------------------------------------------
+            # Existing predictions table migration
+            # -----------------------------------------------------------
+
+            _postgres_add_column_if_missing(
+                conn,
+                "predictions",
+                "model_version",
+                "TEXT NOT NULL DEFAULT '1.0.0'",
+            )
+
+            _postgres_add_column_if_missing(
+                conn,
+                "predictions",
+                "input_features_json",
+                "TEXT NOT NULL DEFAULT '{}'",
+            )
+
+            _postgres_add_column_if_missing(
+                conn,
+                "predictions",
+                "clinical_recommendation",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+
+            conn.execute(
+                text(
+                    "UPDATE patients "
+                    "SET created_at = "
+                    "COALESCE(created_at, admission_time, :now) "
+                    "WHERE created_at IS NULL "
+                    "OR created_at = ''"
+                ),
+                {
+                    "now": utc_now_iso()
+                },
+            )
+
+    if is_sqlite:
+
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "PRAGMA foreign_keys=ON"
+                )
+            )
 
     logger.info(
         "Database initialized successfully: %s",
@@ -374,6 +696,59 @@ def init_db() -> None:
 # ---------------------------------------------------------------------------
 # Patient Helpers
 # ---------------------------------------------------------------------------
+
+def create_patient(
+    name: str,
+    bed_number: Optional[str],
+    age: int,
+    gender: Optional[str],
+) -> dict[str, Any]:
+    """Create a patient and return the API-compatible patient dictionary."""
+
+    db = SessionLocal()
+
+    try:
+
+        now = utc_now_iso()
+
+        external_id = (
+            f"PR-{uuid4().hex[:10].upper()}"
+        )
+
+        patient = Patient(
+            patient_id=external_id,
+            name=name.strip(),
+            bed_number=(
+                bed_number.strip()
+                if bed_number
+                else None
+            ),
+            age=int(age),
+            gender=gender,
+            created_at=now,
+            admission_time=now,
+        )
+
+        db.add(patient)
+        db.commit()
+        db.refresh(patient)
+
+        return _patient_to_dict(
+            patient
+        )
+
+    except Exception:
+        db.rollback()
+
+        logger.exception(
+            "Failed to create patient"
+        )
+
+        raise
+
+    finally:
+        db.close()
+
 
 def get_patient_by_id(
     patient_id: int,
@@ -395,14 +770,9 @@ def get_patient_by_id(
         if not patient:
             return None
 
-        return {
-            "id": patient.id,
-            "patient_id": patient.patient_id,
-            "name": patient.name,
-            "age": patient.age,
-            "gender": patient.gender,
-            "admission_time": patient.admission_time,
-        }
+        return _patient_to_dict(
+            patient
+        )
 
     finally:
         db.close()
@@ -428,14 +798,490 @@ def get_patient_by_external_id(
         if not patient:
             return None
 
-        return {
-            "id": patient.id,
-            "patient_id": patient.patient_id,
-            "name": patient.name,
-            "age": patient.age,
-            "gender": patient.gender,
-            "admission_time": patient.admission_time,
+        return _patient_to_dict(
+            patient
+        )
+
+    finally:
+        db.close()
+
+
+def get_all_patients() -> list[dict[str, Any]]:
+    """Return all patients with their latest prediction summary."""
+
+    db = SessionLocal()
+
+    try:
+
+        patients = (
+            db.query(Patient)
+            .order_by(
+                Patient.id.asc()
+            )
+            .all()
+        )
+
+        result: list[dict[str, Any]] = []
+
+        for patient in patients:
+
+            latest = (
+                db.query(Prediction)
+                .filter(
+                    Prediction.patient_id
+                    == patient.id
+                )
+                .order_by(
+                    Prediction.id.desc()
+                )
+                .first()
+            )
+
+            item = _patient_to_dict(
+                patient
+            )
+
+            item.update(
+                {
+                    "latest_probability": (
+                        latest.sepsis_probability
+                        if latest
+                        else None
+                    ),
+
+                    "latest_risk_level": (
+                        latest.risk_level
+                        if latest
+                        else None
+                    ),
+
+                    "latest_predicted_at": (
+                        latest.predicted_at
+                        if latest
+                        else None
+                    ),
+
+                    "latest_prediction_id": (
+                        latest.id
+                        if latest
+                        else None
+                    ),
+
+                    "model_version": (
+                        latest.model_version
+                        if latest
+                        else None
+                    ),
+                }
+            )
+
+            result.append(item)
+
+        return result
+
+    finally:
+        db.close()
+
+
+def delete_patient(
+    patient_id: int,
+) -> bool:
+    """Delete a patient and all related records."""
+
+    db = SessionLocal()
+
+    try:
+
+        patient = (
+            db.query(Patient)
+            .filter(
+                Patient.id == patient_id
+            )
+            .first()
+        )
+
+        if not patient:
+            return False
+
+        # Explicit deletion keeps this reliable even for older SQLite DBs.
+        db.query(
+            PredictionFeedback
+        ).filter(
+            PredictionFeedback.patient_id
+            == patient_id
+        ).delete(
+            synchronize_session=False
+        )
+
+        db.query(
+            Prediction
+        ).filter(
+            Prediction.patient_id
+            == patient_id
+        ).delete(
+            synchronize_session=False
+        )
+
+        db.query(
+            PatientVital
+        ).filter(
+            PatientVital.patient_id
+            == patient_id
+        ).delete(
+            synchronize_session=False
+        )
+
+        db.delete(patient)
+
+        db.commit()
+
+        return True
+
+    except Exception:
+        db.rollback()
+
+        logger.exception(
+            "Failed to delete patient %s",
+            patient_id,
+        )
+
+        raise
+
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Vitals Helpers
+# ---------------------------------------------------------------------------
+
+def _get_value(
+    row: Any,
+    *names: str,
+) -> Any:
+    """Get the first available value from a pandas-like row."""
+
+    for name in names:
+
+        try:
+            value = row[name]
+
+        except (
+            KeyError,
+            TypeError,
+            IndexError,
+        ):
+            continue
+
+        # Handle pandas NaN.
+        if (
+            isinstance(value, float)
+            and math.isnan(value)
+        ):
+            return None
+
+        return value
+
+    return None
+
+
+def save_vitals_batch(
+    patient_id: int,
+    df: Any,
+) -> int:
+    """Persist a batch of patient vitals from a pandas-like DataFrame."""
+
+    db = SessionLocal()
+
+    try:
+
+        patient = (
+            db.query(Patient)
+            .filter(
+                Patient.id == patient_id
+            )
+            .first()
+        )
+
+        if not patient:
+            raise ValueError(
+                f"Patient {patient_id} does not exist"
+            )
+
+        # Replace the current uploaded vitals for this patient.
+        db.query(
+            PatientVital
+        ).filter(
+            PatientVital.patient_id
+            == patient_id
+        ).delete(
+            synchronize_session=False
+        )
+
+        if hasattr(
+            df,
+            "to_dict",
+        ):
+            records = df.to_dict(
+                orient="records"
+            )
+        else:
+            records = list(df)
+
+        objects: list[PatientVital] = []
+
+        aliases = {
+            "hour": (
+                "hour",
+                "Hour",
+                "hours",
+                "Hours",
+            ),
+
+            "hr": (
+                "hr",
+                "HR",
+                "heart_rate",
+                "HeartRate",
+            ),
+
+            "o2sat": (
+                "o2sat",
+                "O2Sat",
+                "O2SAT",
+                "spo2",
+                "SpO2",
+            ),
+
+            "temp": (
+                "temp",
+                "Temp",
+                "temperature",
+                "Temperature",
+            ),
+
+            "sbp": (
+                "sbp",
+                "SBP",
+                "systolic_bp",
+                "SystolicBP",
+            ),
+
+            "map_val": (
+                "map_val",
+                "MAP",
+                "map",
+                "mean_arterial_pressure",
+            ),
+
+            "resp": (
+                "resp",
+                "Resp",
+                "respiratory_rate",
+                "RespRate",
+            ),
+
+            "wbc": (
+                "wbc",
+                "WBC",
+                "white_blood_cell_count",
+            ),
+
+            "creatinine": (
+                "creatinine",
+                "Creatinine",
+            ),
+
+            "glucose": (
+                "glucose",
+                "Glucose",
+            ),
+
+            "age": (
+                "age",
+                "Age",
+            ),
+
+            "iculos": (
+                "iculos",
+                "ICULOS",
+                "iculos_hours",
+                "ICU_LOS",
+            ),
+
+            "row_index": (
+                "row_index",
+                "row_idx",
+                "index",
+            ),
         }
+
+        for index, row in enumerate(records):
+
+            row_index = _safe_int(
+                _get_value(
+                    row,
+                    *aliases["row_index"],
+                )
+            )
+
+            objects.append(
+                PatientVital(
+                    patient_id=patient_id,
+
+                    hour=_finite_float(
+                        _get_value(
+                            row,
+                            *aliases["hour"],
+                        )
+                    ),
+
+                    hr=_finite_float(
+                        _get_value(
+                            row,
+                            *aliases["hr"],
+                        )
+                    ),
+
+                    o2sat=_finite_float(
+                        _get_value(
+                            row,
+                            *aliases["o2sat"],
+                        )
+                    ),
+
+                    temp=_finite_float(
+                        _get_value(
+                            row,
+                            *aliases["temp"],
+                        )
+                    ),
+
+                    sbp=_finite_float(
+                        _get_value(
+                            row,
+                            *aliases["sbp"],
+                        )
+                    ),
+
+                    map_val=_finite_float(
+                        _get_value(
+                            row,
+                            *aliases["map_val"],
+                        )
+                    ),
+
+                    resp=_finite_float(
+                        _get_value(
+                            row,
+                            *aliases["resp"],
+                        )
+                    ),
+
+                    wbc=_finite_float(
+                        _get_value(
+                            row,
+                            *aliases["wbc"],
+                        )
+                    ),
+
+                    creatinine=_finite_float(
+                        _get_value(
+                            row,
+                            *aliases["creatinine"],
+                        )
+                    ),
+
+                    glucose=_finite_float(
+                        _get_value(
+                            row,
+                            *aliases["glucose"],
+                        )
+                    ),
+
+                    age=_safe_int(
+                        _get_value(
+                            row,
+                            *aliases["age"],
+                        )
+                    ),
+
+                    iculos=_safe_int(
+                        _get_value(
+                            row,
+                            *aliases["iculos"],
+                        )
+                    ),
+
+                    row_index=(
+                        row_index
+                        if row_index is not None
+                        else index
+                    ),
+                )
+            )
+
+        if objects:
+            db.add_all(objects)
+
+        db.commit()
+
+        return len(objects)
+
+    except Exception:
+        db.rollback()
+
+        logger.exception(
+            "Failed to save vitals for patient %s",
+            patient_id,
+        )
+
+        raise
+
+    finally:
+        db.close()
+
+
+def get_vitals_for_patient(
+    patient_id: int,
+) -> list[dict[str, Any]]:
+    """Return stored vitals in the shape expected by the API models."""
+
+    db = SessionLocal()
+
+    try:
+
+        rows = (
+            db.query(PatientVital)
+            .filter(
+                PatientVital.patient_id
+                == patient_id
+            )
+            .order_by(
+                PatientVital.row_index.asc(),
+                PatientVital.id.asc(),
+            )
+            .all()
+        )
+
+        return [
+            {
+                "hour": row.hour,
+                "hr": row.hr,
+                "o2sat": row.o2sat,
+                "temp": row.temp,
+                "sbp": row.sbp,
+                "map_val": row.map_val,
+                "resp": row.resp,
+                "wbc": row.wbc,
+                "creatinine": row.creatinine,
+                "glucose": row.glucose,
+                "age": row.age,
+                "iculos": row.iculos,
+                "row_index": row.row_index,
+            }
+            for row in rows
+        ]
 
     finally:
         db.close()
@@ -456,10 +1302,6 @@ def save_prediction(
 ) -> int:
     """
     Save a model prediction together with the exact model input snapshot.
-
-    The input feature snapshot is important for future training because
-    feedback must be connected to the exact feature vector used when
-    the original prediction was generated.
     """
 
     db = SessionLocal()
@@ -476,18 +1318,21 @@ def save_prediction(
 
             risk_level=risk_level,
 
-            shap_json=json.dumps(
+            shap_json=_json_dumps(
                 shap_factors,
-                allow_nan=False,
+                [],
             ),
 
             predicted_at=utc_now_iso(),
 
-            model_version=model_version,
+            model_version=(
+                model_version
+                or "1.0.0"
+            ),
 
-            input_features_json=json.dumps(
-                input_features or {},
-                allow_nan=False,
+            input_features_json=_json_dumps(
+                input_features,
+                {},
             ),
 
             clinical_recommendation=(
@@ -497,17 +1342,23 @@ def save_prediction(
         )
 
         db.add(prediction)
+
         db.commit()
+
         db.refresh(prediction)
 
-        return int(prediction.id)
+        return int(
+            prediction.id
+        )
 
     except Exception:
         db.rollback()
+
         logger.exception(
             "Failed to save prediction for patient %s",
             patient_id,
         )
+
         raise
 
     finally:
@@ -517,7 +1368,7 @@ def save_prediction(
 def get_prediction_by_id(
     prediction_id: int,
 ) -> Optional[dict[str, Any]]:
-    """Return a complete prediction including model input snapshot."""
+    """Return a complete prediction including its input snapshot."""
 
     db = SessionLocal()
 
@@ -526,7 +1377,8 @@ def get_prediction_by_id(
         prediction = (
             db.query(Prediction)
             .filter(
-                Prediction.id == prediction_id
+                Prediction.id
+                == prediction_id
             )
             .first()
         )
@@ -534,51 +1386,9 @@ def get_prediction_by_id(
         if not prediction:
             return None
 
-        return {
-            "id": prediction.id,
-
-            "patient_id":
-                prediction.patient_id,
-
-            "sepsis_probability":
-                prediction.sepsis_probability,
-
-            "risk_level":
-                prediction.risk_level,
-
-            "shap_factors":
-                safe_json_loads(
-                    prediction.shap_json,
-                    [],
-                ),
-
-            "predicted_at":
-                prediction.predicted_at,
-
-            "model_version":
-                getattr(
-                    prediction,
-                    "model_version",
-                    "1.0.0",
-                ),
-
-            "input_features":
-                safe_json_loads(
-                    getattr(
-                        prediction,
-                        "input_features_json",
-                        "{}",
-                    ),
-                    {},
-                ),
-
-            "clinical_recommendation":
-                getattr(
-                    prediction,
-                    "clinical_recommendation",
-                    "",
-                ),
-        }
+        return _prediction_to_dict(
+            prediction
+        )
 
     finally:
         db.close()
@@ -596,7 +1406,8 @@ def get_latest_prediction(
         prediction = (
             db.query(Prediction)
             .filter(
-                Prediction.patient_id == patient_id
+                Prediction.patient_id
+                == patient_id
             )
             .order_by(
                 Prediction.id.desc()
@@ -607,51 +1418,9 @@ def get_latest_prediction(
         if not prediction:
             return None
 
-        return {
-            "id": prediction.id,
-
-            "patient_id":
-                prediction.patient_id,
-
-            "sepsis_probability":
-                prediction.sepsis_probability,
-
-            "risk_level":
-                prediction.risk_level,
-
-            "shap_factors":
-                safe_json_loads(
-                    prediction.shap_json,
-                    [],
-                ),
-
-            "predicted_at":
-                prediction.predicted_at,
-
-            "model_version":
-                getattr(
-                    prediction,
-                    "model_version",
-                    "1.0.0",
-                ),
-
-            "input_features":
-                safe_json_loads(
-                    getattr(
-                        prediction,
-                        "input_features_json",
-                        "{}",
-                    ),
-                    {},
-                ),
-
-            "clinical_recommendation":
-                getattr(
-                    prediction,
-                    "clinical_recommendation",
-                    "",
-                ),
-        }
+        return _prediction_to_dict(
+            prediction
+        )
 
     finally:
         db.close()
@@ -668,42 +1437,28 @@ def feedback_to_dict(
 
     return {
         "id": row.id,
-
-        "prediction_id":
-            row.prediction_id,
-
-        "patient_id":
-            row.patient_id,
-
-        "submitted_by":
-            row.submitted_by,
-
-        "prediction_assessment":
-            row.prediction_assessment,
-
-        "recommendation_assessment":
-            row.recommendation_assessment,
-
-        "actual_outcome":
-            row.actual_outcome,
-
-        "outcome_at":
-            row.outcome_at,
-
-        "outcome_notes":
-            row.outcome_notes,
-
-        "validation_status":
-            row.validation_status,
-
-        "validation_reason":
-            row.validation_reason,
-
-        "dataset_exported_at":
-            row.dataset_exported_at,
-
-        "created_at":
-            row.created_at,
+        "prediction_id": row.prediction_id,
+        "patient_id": row.patient_id,
+        "submitted_by": row.submitted_by,
+        "prediction_assessment": (
+            row.prediction_assessment
+        ),
+        "recommendation_assessment": (
+            row.recommendation_assessment
+        ),
+        "actual_outcome": row.actual_outcome,
+        "outcome_at": row.outcome_at,
+        "outcome_notes": row.outcome_notes,
+        "validation_status": (
+            row.validation_status
+        ),
+        "validation_reason": (
+            row.validation_reason
+        ),
+        "dataset_exported_at": (
+            row.dataset_exported_at
+        ),
+        "created_at": row.created_at,
     }
 
 
@@ -727,34 +1482,30 @@ def create_feedback(
 
         feedback = PredictionFeedback(
             prediction_id=prediction_id,
-
             patient_id=patient_id,
-
             submitted_by=submitted_by,
-
             prediction_assessment=(
                 prediction_assessment
             ),
-
             recommendation_assessment=(
                 recommendation_assessment
             ),
-
             actual_outcome=actual_outcome,
-
             outcome_at=outcome_at,
-
             outcome_notes=outcome_notes,
-
-            validation_status=validation_status,
-
-            validation_reason=validation_reason,
-
+            validation_status=(
+                validation_status
+            ),
+            validation_reason=(
+                validation_reason
+            ),
             created_at=utc_now_iso(),
         )
 
         db.add(feedback)
+
         db.commit()
+
         db.refresh(feedback)
 
         return feedback_to_dict(
@@ -790,7 +1541,9 @@ def get_feedback(
         if not row:
             return None
 
-        return feedback_to_dict(row)
+        return feedback_to_dict(
+            row
+        )
 
     finally:
         db.close()
@@ -800,7 +1553,7 @@ def get_feedback_by_prediction_and_user(
     prediction_id: int,
     submitted_by: str,
 ) -> Optional[dict[str, Any]]:
-    """Check whether a user has already submitted feedback."""
+    """Return existing feedback for a prediction/user pair, if present."""
 
     db = SessionLocal()
 
@@ -821,7 +1574,9 @@ def get_feedback_by_prediction_and_user(
         if not row:
             return None
 
-        return feedback_to_dict(row)
+        return feedback_to_dict(
+            row
+        )
 
     finally:
         db.close()
@@ -837,12 +1592,7 @@ def update_feedback(
     validation_status: str,
     validation_reason: str,
 ) -> Optional[dict[str, Any]]:
-    """
-    Update feedback.
-
-    Used primarily when an initially UNKNOWN clinical outcome
-    becomes available later.
-    """
+    """Update an existing feedback record."""
 
     db = SessionLocal()
 
@@ -874,7 +1624,9 @@ def update_feedback(
 
         row.outcome_at = outcome_at
 
-        row.outcome_notes = outcome_notes
+        row.outcome_notes = (
+            outcome_notes
+        )
 
         row.validation_status = (
             validation_status
@@ -884,15 +1636,16 @@ def update_feedback(
             validation_reason
         )
 
-        # If the record changes after being rejected/pending,
-        # it should be eligible for a fresh export.
-        if validation_status != "ELIGIBLE":
-            row.dataset_exported_at = None
+        # Any update invalidates a previous export marker.
+        row.dataset_exported_at = None
 
         db.commit()
+
         db.refresh(row)
 
-        return feedback_to_dict(row)
+        return feedback_to_dict(
+            row
+        )
 
     except Exception:
         db.rollback()
@@ -991,7 +1744,7 @@ def get_eligible_feedback_for_dataset(
     Only ELIGIBLE records are returned.
 
     By default, already-exported records are excluded to prevent
-    duplicate dataset rows.
+    duplicate incremental dataset rows.
     """
 
     db = SessionLocal()
@@ -1035,43 +1788,50 @@ def get_eligible_feedback_for_dataset(
 
             result.append(
                 {
-                    "feedback":
-                        feedback_to_dict(
-                            feedback
-                        ),
+                    "feedback": feedback_to_dict(
+                        feedback
+                    ),
 
                     "prediction": {
-                        "id":
-                            prediction.id,
+                        "id": prediction.id,
 
-                        "patient_id":
-                            prediction.patient_id,
+                        "patient_id": (
+                            prediction.patient_id
+                        ),
 
-                        "sepsis_probability":
-                            prediction.sepsis_probability,
+                        "sepsis_probability": (
+                            prediction.sepsis_probability
+                        ),
 
-                        "risk_level":
-                            prediction.risk_level,
+                        "risk_level": (
+                            prediction.risk_level
+                        ),
 
-                        "predicted_at":
-                            prediction.predicted_at,
+                        "predicted_at": (
+                            prediction.predicted_at
+                        ),
 
-                        "model_version":
-                            getattr(
-                                prediction,
-                                "model_version",
-                                "1.0.0",
-                            ),
+                        "model_version": (
+                            prediction.model_version
+                        ),
 
-                        "input_features":
+                        "input_features": (
                             safe_json_loads(
-                                getattr(
-                                    prediction,
-                                    "input_features_json",
-                                    "{}",
-                                ),
+                                prediction.input_features_json,
                                 {},
-                            ),
+                            )
+                        ),
+
+                        "shap_factors": (
+                            safe_json_loads(
+                                prediction.shap_json,
+                                [],
+                            )
+                        ),
+
+                        "clinical_recommendation": (
+                            prediction.clinical_recommendation
+                        ),
                     },
                 }
             )
@@ -1085,12 +1845,7 @@ def get_eligible_feedback_for_dataset(
 def mark_feedback_exported(
     feedback_ids: list[int],
 ) -> None:
-    """
-    Mark feedback records as exported.
-
-    This prevents the same eligible records from appearing in
-    subsequent incremental dataset exports.
-    """
+    """Mark eligible feedback records as exported."""
 
     if not feedback_ids:
         return
@@ -1108,7 +1863,10 @@ def mark_feedback_exported(
             .filter(
                 PredictionFeedback.id.in_(
                     feedback_ids
-                )
+                ),
+
+                PredictionFeedback.validation_status
+                == "ELIGIBLE",
             )
             .update(
                 {
@@ -1130,17 +1888,16 @@ def mark_feedback_exported(
 
 
 # ---------------------------------------------------------------------------
-# Optional Dependency
+# Optional FastAPI Dependency
 # ---------------------------------------------------------------------------
 
-def get_db():
-    """
-    FastAPI dependency for routes that need a database session.
-    """
+def get_db() -> Generator[Session, None, None]:
+    """FastAPI dependency that yields a database session."""
 
     db = SessionLocal()
 
     try:
         yield db
+
     finally:
         db.close()
