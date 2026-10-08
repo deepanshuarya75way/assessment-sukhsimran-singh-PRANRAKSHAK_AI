@@ -13,7 +13,7 @@ from logging_config import setup_logging, get_logger
 import predictor
 import shap_explainer
 
-from routes import patients, predictions, alerts, copilot
+from routes import patients, predictions, alerts, copilot, feedback 
 
 # ─── Logging must be configured before anything else ─────────────────────────
 setup_logging()
@@ -185,4 +185,4 @@ app.include_router(patients.router)
 app.include_router(predictions.router)
 app.include_router(alerts.router)
 app.include_router(copilot.router)
-
+app.include_router(feedback.router)
