@@ -22,6 +22,8 @@ class Settings(BaseSettings):
 
     # Env
     env: str = "development"
+    model_version: str = "1.0.0"
+    feedback_api_key: str = ""
 
     class Config:
         env_file = ".env"
